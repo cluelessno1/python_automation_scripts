@@ -8,7 +8,8 @@ import asyncio
 linkedin_username = ''
 linkedin_password = ''
 linkedin_login_url = 'https://www.linkedin.com/login'
-linkedin_peoples_search_page_url = 'https://www.linkedin.com/search/results/people/?currentCompany=%5B%221441%22%5D&geoUrn=%5B%22102713980%22%5D&keywords=senior%20engineer&origin=FACETED_SEARCH'
+# linkedin_peoples_search_page_url = 'https://www.linkedin.com/search/results/people/?currentCompany=%5B%221441%22%5D&geoUrn=%5B%22102713980%22%5D&keywords=senior%20engineer&origin=FACETED_SEARCH'
+linkedin_peoples_search_page_url = 'https://www.linkedin.com/search/results/people/?currentCompany=%5B%223185%22%5D&keywords=senior%20engineer&origin=FACETED_SEARCH&page=2&sid=E!Q'
 
 # Function to log into LinkedIn
 def linkedin_login(username, password):    
@@ -85,9 +86,39 @@ async def connect_with_people(search_page_url, max_pages=5, stop_message="No res
 
 async def send_connection_request_to_people(button):
     button_aria_label = button.get_attribute('aria-label')
-    name = button_aria_label[button_aria_label.index("Invite"):button_aria_label.index("to connect")].strip()
+    name = button_aria_label[button_aria_label.index("Invite")+len("Invite"):button_aria_label.index("to connect")].strip()
     print(f"Sending connection request to {name}")
+    try:
+        button.click()
+        time.sleep(5)
+        # XPath to find buttons with 'Add a note' in aria-label
+        add_a_note_button = driver.find_element(By.XPATH, "//button[contains(@aria-label, 'Add a note')]")
+        add_a_note_button.click()
+        time.sleep(5)
+        await enter_custom_message(name)
 
+
+    except Exception as e:
+        print(f"Exception occurred : {e}")
+    
+
+# Function to enter a custom message in the textarea
+async def enter_custom_message(name):
+    try:
+        custom_message = f'''Hi {name},
+        
+<Your message>'''
+        # Find the textarea by ID and enter the custom message
+        textarea = driver.find_element(By.ID, 'custom-message')
+        textarea.clear()  # Clear any existing text (optional)
+        textarea.send_keys(custom_message)
+        print("Custom message entered successfully!")
+        time.sleep(5)
+        send_invitation_button = driver.find_element(By.XPATH, "//button[contains(@aria-label, 'Send invitation')]")
+        send_invitation_button.click()
+        time.sleep(5)
+    except Exception as e:
+        print(f"An error occurred: {e}")
 
 driver = webdriver.Chrome()
 
