@@ -2,18 +2,16 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 import time
-import re
+import asyncio
 
 # Replace these with your LinkedIn credentials
 linkedin_username = ''
 linkedin_password = ''
 linkedin_login_url = 'https://www.linkedin.com/login'
-linkedin_peoples_search_page_url = 'https://www.linkedin.com/search/results/people/?currentCompany=%5B%221441%22%5D&geoUrn=%5B%22102713980%22%5D&keywords=senior%20engineer&origin=FACETED_SEARCH&page=2&sid=V.h'
-
+linkedin_peoples_search_page_url = 'https://www.linkedin.com/search/results/people/?currentCompany=%5B%221441%22%5D&geoUrn=%5B%22102713980%22%5D&keywords=senior%20engineer&origin=FACETED_SEARCH'
 
 # Function to log into LinkedIn
 def linkedin_login(username, password):    
-        
     # Open LinkedIn login page
     driver.get(linkedin_login_url)
 
@@ -38,7 +36,8 @@ def linkedin_login(username, password):
         print("Login failed, please check your credentials or CAPTCHA")
 
 
-# This function will remove '&page=' from the linkedin search page url provided by the user, so that we can append it ourselves in the func connect_with_people and parse through multiple pages iteratively
+# This function will remove '&page=' from the linkedin search page url provided by the user,
+# so that we can append it ourselves in the func connect_with_people and parse through multiple pages iteratively
 def parse_linkedin_peoples_search_page_url(linkedin_peoples_search_page_url):
     if '&page=' in linkedin_peoples_search_page_url:
         startIndex = linkedin_peoples_search_page_url.index('&page=')
@@ -51,22 +50,43 @@ def parse_linkedin_peoples_search_page_url(linkedin_peoples_search_page_url):
     print(f"Cleaned new search page url is : {linkedin_peoples_search_page_url}")
     return linkedin_peoples_search_page_url
 
-# Function to connect with people
-def connect_with_people(search_page_url):  
-    # Open the LinkedIn People Search page url
-    driver.get(search_page_url)
-    # Wait for a few seconds for the page to load
-    time.sleep(10)
 
-    # XPath to find buttons with a common label pattern
-    # Example: buttons with text that contain the pattern
-    buttons = driver.find_elements(By.XPATH, "//button[contains(@aria-label, 'to connect')]")
-    
-    # Print the list of buttons found
-    for button in buttons:
-        print(button.get_attribute('aria-label'))
+# Function to connect with people iteratively across pages
+async def connect_with_people(search_page_url, max_pages=5, stop_message="No results found"):
+    page = 1
+    while page <= max_pages:
+        # Append the current page number to the URL
+        paginated_url = f"{search_page_url}&page={page}"
+        print(f"Processing page {page}: {paginated_url}")
+        
+        # Open the LinkedIn People Search page URL
+        driver.get(paginated_url)
+        time.sleep(10)  # Wait for the page to load
 
+        # Check for the stop message indicating the end of results
+        try:
+            # Locate the element with the message (you can modify the XPath to match the actual message element)
+            stop_element = driver.find_element(By.XPATH, f"//*[contains(text(), '{stop_message}')]")
+            print("Stop message found, exiting...")
+            break  # Exit the loop if the stop message is found
+        except:
+            print(f"No stop message on page {page}, continuing...")
 
+        # XPath to find buttons with 'to connect' in aria-label
+        buttons = driver.find_elements(By.XPATH, "//button[contains(@aria-label, 'to connect')]")
+
+        # Print the list of buttons found
+        for button in buttons:
+            await send_connection_request_to_people(button)
+
+        
+        # Move to the next page
+        page += 1
+
+async def send_connection_request_to_people(button):
+    button_aria_label = button.get_attribute('aria-label')
+    name = button_aria_label[button_aria_label.index("Invite"):button_aria_label.index("to connect")].strip()
+    print(f"Sending connection request to {name}")
 
 
 driver = webdriver.Chrome()
@@ -74,16 +94,13 @@ driver = webdriver.Chrome()
 # Call the login function
 linkedin_login(linkedin_username, linkedin_password)
 
-# # Open the LinkedIn People Search page url
-# driver.get(linkedin_peoples_search_page_url)
-# # Wait for a few seconds for the page to load
-# time.sleep(10)
-
+# Clean up the search page URL (remove &page= if it exists)
 linkedin_peoples_search_page_url = parse_linkedin_peoples_search_page_url(linkedin_peoples_search_page_url)
 
-connect_with_people(linkedin_peoples_search_page_url)
+# Connect with people, iterating over multiple pages
+asyncio.run(connect_with_people(linkedin_peoples_search_page_url))
 
-time.sleep(60)
+# time.sleep(60)
 
 # Close the browser
 driver.quit()
