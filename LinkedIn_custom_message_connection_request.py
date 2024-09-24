@@ -11,6 +11,8 @@ linkedin_login_url = 'https://www.linkedin.com/login'
 # Copy paste the browser url when on the LinkedIn search page after clicking on the People tab and selecting all the filters you want
 linkedin_peoples_search_page_url = 'https://www.linkedin.com/search/results/people/?currentCompany=%5B%221382%22%5D&keywords=senior%20engineer&origin=FACETED_SEARCH&searchId=98f22d04-e3c4-437f-bdff-f4765c5a03db&sid=m1j'
 SLEEP_COUNT_IN_SECS = 5
+# May be asked to solve Captcha after repeated use
+SLEEP_COUNT_IN_SECS_LOGIN_PAGE = 15
 CUSTOM_MESSAGE_TO_BE_SENT_IN_THE_CONNECTION_INVITE = "\n\nI'm Shashwat, a software engineer at Qualcomm specializing in automation, AWS migration, and backend development. Looking forward to connect!\n\nRegards,\nShashwat"
 # Maximum connection requests to try to send in one session
 MAX_CONNECTION_SENT_COUNT = 10
@@ -28,7 +30,7 @@ def linkedin_login(username, password):
         password_input = driver.find_element(By.ID, 'password')
         password_input.send_keys(password)
         password_input.send_keys(Keys.RETURN)
-        time.sleep(SLEEP_COUNT_IN_SECS)
+        time.sleep(SLEEP_COUNT_IN_SECS_LOGIN_PAGE) # Solve Captcha if prompted. Will be asked only once.
 
         # Check if login is successful
         if "feed" in driver.current_url:
@@ -65,14 +67,15 @@ def connect_with_people(search_url, max_connection_sent_count=MAX_CONNECTION_SEN
         driver.get(paginated_url)
         time.sleep(SLEEP_COUNT_IN_SECS)  # Wait for the page to load
 
-        # Check for the stop message indicating the end of results
-        try:
-            # Locate the element with the message (you can modify the XPath to match the actual message element)
-            stop_element = driver.find_element(By.XPATH, f"//*[contains(text(), '{stop_message}')]")
-            print("Stop message found, exiting...")
-            break  # Exit the loop if the stop message is found
-        except:
-            print(f"No stop message on page {page}, continuing...")
+        # This logic is not working right now. Will debug and fix this later
+        # # Check for the stop message indicating the end of results
+        # try:
+        #     # Locate the element with the message (you can modify the XPath to match the actual message element)
+        #     stop_element = driver.find_element(By.XPATH, f"//h2[contains(text(), '{stop_message}')]")
+        #     print("Stop message found, exiting...")
+        #     break  # Exit the loop if the stop message is found
+        # except:
+        #     print(f"No stop message on page {page}, continuing...")
 
         try:
             # Get all connection buttons
