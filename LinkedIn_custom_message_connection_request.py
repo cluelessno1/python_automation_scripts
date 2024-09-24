@@ -5,14 +5,15 @@ from selenium.webdriver.common.keys import Keys
 import time
 
 # Replace these with your LinkedIn credentials
-linkedin_username = ''
+linkedin_username = 'shashwat1999@gmail.com'
 linkedin_password = ''
 linkedin_login_url = 'https://www.linkedin.com/login'
-linkedin_peoples_search_page_url = 'https://www.linkedin.com/search/results/people/?currentCompany=%5B%223185%22%5D&keywords=senior%20engineer&origin=FACETED_SEARCH&page=2&sid=E!Q'
+# Copy paste the browser url when on the LinkedIn search page after clicking on the People tab and selecting all the filters you want
+linkedin_peoples_search_page_url = 'https://www.linkedin.com/search/results/people/?currentCompany=%5B%221382%22%5D&keywords=senior%20engineer&origin=FACETED_SEARCH&searchId=98f22d04-e3c4-437f-bdff-f4765c5a03db&sid=m1j'
 SLEEP_COUNT_IN_SECS = 5
 CUSTOM_MESSAGE_TO_BE_SENT_IN_THE_CONNECTION_INVITE = "\n\nI'm Shashwat, a software engineer at Qualcomm specializing in automation, AWS migration, and backend development. Looking forward to connect!\n\nRegards,\nShashwat"
 # Maximum connection requests to try to send in one session
-MAX_CONNECTION_SENT_COUNT = 20
+MAX_CONNECTION_SENT_COUNT = 10
 # Maxiumum search pages to iterate through
 MAX_PAGES_COUNT = 10
 
@@ -77,9 +78,11 @@ def connect_with_people(search_url, max_connection_sent_count=MAX_CONNECTION_SEN
             # Get all connection buttons
             connect_buttons = driver.find_elements(By.XPATH, "//button[contains(@aria-label, 'Invite')]")
             for button in connect_buttons:
+                if connection_sent_count >= max_connection_sent_count:
+                    break
                 connect_with_single_person(button)
+                connection_sent_count += 1
             print("Finished sending connection requests on the current page.")
-            connection_sent_count += 1
         except Exception as e:
             print(f"Error during connecting with people: {e}")
 
@@ -115,6 +118,7 @@ def enter_custom_message(name):
         textarea.clear()
         textarea.send_keys(custom_message)
         print(f"Custom message for {name} entered successfully.")
+        time.sleep(SLEEP_COUNT_IN_SECS)
 
         send_invitation_button = driver.find_element(By.XPATH, "//button[contains(@aria-label, 'Send invitation')]")
         send_invitation_button.click()
@@ -126,7 +130,7 @@ def enter_custom_message(name):
 
 # Main logic
 if __name__ == "__main__":
-    driver = webdriver.Chrome()  # Initialize WebDriver inside main
+    driver = webdriver.Chrome()  # Initialize WebDriver
 
     if linkedin_login(linkedin_username, linkedin_password):
         linkedin_peoples_search_page_url = parse_linkedin_peoples_search_page_url(linkedin_peoples_search_page_url)
