@@ -1,5 +1,6 @@
 import argparse
 import datetime
+import json
 import os
 import sys
 import time
@@ -25,6 +26,7 @@ CLICK_SETTLE_SECS = 0.4  # brief pause after a click for LinkedIn's JS to react
 LOGIN_CHECKPOINT_TIMEOUT = 90  # max seconds to wait for manual checkpoint solve
 MAX_CONNECTIONS = 10
 MAX_PAGES = 10
+SENT_LOG_PATH = os.path.join("data", "sent_connections.jsonl")
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -57,6 +59,196 @@ def setup_log_file() -> None:
     path = os.path.join("logs", f"run_{timestamp}.log")
     LOG_FILE = open(path, "w", encoding="utf-8")
     log(f"Log file: {path}")
+
+
+# ---------------------------------------------------------------------------
+# Sent-connection log (cross-run dedup)
+# ---------------------------------------------------------------------------
+
+def xpath_literal(value: str) -> str:
+    """Build an XPath string literal safe for names containing quotes."""
+    if "'" not in value:
+        return f"'{value}'"
+    if '"' not in value:
+        return f'"{value}"'
+    parts = value.split("'")
+    return "concat(" + ", \"'\", ".join(f"'{part}'" for part in parts) + ")"
+
+
+def invite_aria_label(name: str) -> str:
+    return f"Invite {name} to connect"
+
+
+def is_valid_name(name: str) -> bool:
+    cleaned = (name or "").strip()
+    return bool(cleaned) and cleaned.lower() != "unknown"
+
+
+NAME_PREFIXES = frozenset({
+    "dr", "mr", "mrs", "ms", "miss", "mx", "prof", "sir", "dame", "hon",
+})
+
+
+def greeting_name(full_name: str) -> str:
+    parts = full_name.split()
+    i = 0
+    while i < len(parts) and parts[i].lower().rstrip(".") in NAME_PREFIXES:
+        i += 1
+    if i >= len(parts):
+        return full_name.strip()
+    return parts[i]
+
+
+def normalize_profile_url(url: str | None) -> str:
+    if not url:
+        return ""
+    normalized = url.split("?")[0].rstrip("/")
+    return normalized.lower()
+
+
+class SentLog:
+    """Persistent record of successfully sent connection requests."""
+
+    def __init__(self) -> None:
+        self.names: set[str] = set()
+        self.profile_urls: set[str] = set()
+        self._load()
+
+    def _load(self) -> None:
+        if not os.path.exists(SENT_LOG_PATH):
+            return
+        with open(SENT_LOG_PATH, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    vlog(f"Skipping malformed sent-log line: {line!r}")
+                    continue
+                name = (entry.get("name") or "").strip()
+                profile_url = normalize_profile_url(entry.get("profile_url"))
+                if name:
+                    self.names.add(name.lower())
+                if profile_url:
+                    self.profile_urls.add(profile_url)
+
+    def already_sent(self, name: str, profile_url: str | None = None) -> bool:
+        if name.strip().lower() in self.names:
+            return True
+        normalized = normalize_profile_url(profile_url)
+        return bool(normalized and normalized in self.profile_urls)
+
+    def record(self, name: str, profile_url: str | None = None) -> None:
+        os.makedirs(os.path.dirname(SENT_LOG_PATH), exist_ok=True)
+        entry = {
+            "name": name,
+            "profile_url": profile_url or "",
+            "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+        }
+        with open(SENT_LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry) + "\n")
+        self.names.add(name.strip().lower())
+        normalized = normalize_profile_url(profile_url)
+        if normalized:
+            self.profile_urls.add(normalized)
+        vlog(f"Recorded sent connection: {name!r} ({profile_url or 'no profile URL'})")
+
+
+def collect_modal_aria_labels(driver) -> list[str]:
+    """Collect aria-labels from the open invite modal (shadow DOM or custom-invite page)."""
+    try:
+        host = driver.find_element(By.CSS_SELECTOR, "#interop-outlet")
+        shadow_labels = driver.execute_script("""
+            const root = arguments[0].shadowRoot;
+            if (!root) return [];
+            return Array.from(root.querySelectorAll('[aria-label]'))
+                .map(el => el.getAttribute('aria-label'))
+                .filter(Boolean);
+        """, host)
+        if shadow_labels:
+            return shadow_labels
+    except Exception:
+        pass
+
+    if "custom-invite" in driver.current_url:
+        labels: list[str] = []
+        for el in driver.find_elements(By.XPATH, "//*[@aria-label]"):
+            try:
+                label = el.get_dom_attribute("aria-label")
+                if label:
+                    labels.append(label)
+            except Exception:
+                continue
+        return labels
+    return []
+
+
+def collect_modal_text(driver) -> str:
+    """Collect visible text from the open invite modal."""
+    try:
+        host = driver.find_element(By.CSS_SELECTOR, "#interop-outlet")
+        text = driver.execute_script("""
+            const root = arguments[0].shadowRoot;
+            return root ? (root.innerText || root.textContent || '') : '';
+        """, host)
+        if text:
+            return text
+    except Exception:
+        pass
+
+    if "custom-invite" in driver.current_url:
+        try:
+            return driver.find_element(By.TAG_NAME, "body").text
+        except Exception:
+            pass
+    return ""
+
+
+def is_invite_modal_open(labels: list[str]) -> bool:
+    invite_signals = (
+        "add a note",
+        "send without a note",
+        "send invitation",
+        "cancel adding a note",
+    )
+    return any(
+        any(signal in label.lower() for signal in invite_signals)
+        for label in labels
+    )
+
+
+def verify_modal_recipient(driver, expected_name: str,
+                           connect_button_verified: bool = False) -> tuple[bool, str | None]:
+    """Confirm the open invite modal targets the expected person before sending."""
+    if not is_valid_name(expected_name):
+        return False, "Invalid or unknown recipient name"
+
+    expected_label = invite_aria_label(expected_name)
+    labels = collect_modal_aria_labels(driver)
+    for label in labels:
+        if label == expected_label:
+            vlog(f"Modal recipient verified (exact): {expected_label!r}")
+            return True, None
+
+    for label in labels:
+        if expected_name in label:
+            vlog(f"Modal recipient verified (name in label): {label!r}")
+            return True, None
+
+    modal_text = collect_modal_text(driver)
+    if expected_name in modal_text:
+        vlog(f"Modal recipient verified (name in modal text)")
+        return True, None
+
+    if connect_button_verified and is_invite_modal_open(labels):
+        vlog("Modal recipient verified (exact Connect click + invite modal open)")
+        return True, None
+
+    reason = f"Modal recipient mismatch (expected {expected_name!r})"
+    vlog(f"{reason}. Modal aria-labels seen: {labels!r}")
+    return False, reason
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +338,23 @@ def wait_for_shadow_dom(driver, css_selector: str, timeout=ELEMENT_TIMEOUT):
         return None
 
 
+def wait_for_invite_modal(driver, timeout=PAGE_LOAD_TIMEOUT) -> bool:
+    """Wait until the Connect invite dialog is open (shadow modal or custom-invite page)."""
+
+    def _ready(d):
+        if "custom-invite" in d.current_url or "preload" in d.current_url:
+            return bool(d.find_elements(By.XPATH, "//textarea"))
+        return is_invite_modal_open(collect_modal_aria_labels(d))
+
+    try:
+        WebDriverWait(driver, timeout).until(_ready)
+        vlog("Invite modal is open.")
+        return True
+    except Exception:
+        vlog("Timed out waiting for invite modal.")
+        return False
+
+
 def ensure_modal_closed(driver) -> None:
     """Dismiss any open Connect modal before the next invite."""
     try:
@@ -221,46 +430,58 @@ def collect_profile_url(element) -> str | None:
     return None
 
 
-def parse_connect_name(aria_label: str) -> str:
-    if "Invite" in aria_label and "to connect" in aria_label:
-        return aria_label[aria_label.index("Invite") + len("Invite"):
-                      aria_label.index("to connect")].strip()
-    if "Connect with" in aria_label:
-        return aria_label[aria_label.index("Connect with") + len("Connect with"):].strip()
-    return "Unknown"
+def parse_connect_name(aria_label: str) -> str | None:
+    invite_prefix = "Invite "
+    invite_suffix = " to connect"
+    if aria_label.startswith(invite_prefix) and aria_label.endswith(invite_suffix):
+        name = aria_label[len(invite_prefix):-len(invite_suffix)].strip()
+        return name or None
+    connect_prefix = "Connect with "
+    if aria_label.startswith(connect_prefix):
+        name = aria_label[len(connect_prefix):].strip()
+        return name or None
+    return None
 
 
-def collect_connect_names(driver) -> list[str]:
-    """Collect unique names from Connect/Invite buttons on the current search page."""
-    names: list[str] = []
+def collect_connect_entries(driver) -> list[tuple[str, str | None]]:
+    """Collect unique (name, profile_url) pairs from Connect/Invite buttons on the page."""
+    entries: list[tuple[str, str | None]] = []
+    seen: set[str] = set()
     xpath = multi_tag_xpath(
-        "(contains(@aria-label, 'Invite') or contains(@aria-label, 'Connect')) and "
-        "not(contains(@aria-label, 'Unfollow')) and "
-        "not(contains(@aria-label, 'Following'))"
+        "(starts-with(@aria-label, 'Invite ') and contains(@aria-label, ' to connect')) or "
+        "starts-with(@aria-label, 'Connect with ')"
     )
     for el in driver.find_elements(By.XPATH, xpath):
-        name = parse_connect_name(el.get_dom_attribute("aria-label") or "")
-        if name != "Unknown" and name not in names:
-            names.append(name)
-    return names
+        aria_label = el.get_dom_attribute("aria-label") or ""
+        name = parse_connect_name(aria_label)
+        if not is_valid_name(name or ""):
+            continue
+        if name in seen:
+            continue
+        seen.add(name)
+        entries.append((name, collect_profile_url(el)))
+    return entries
 
 
 def find_connect_element_for_name(driver, name: str):
     """Re-find a fresh Connect element for a person (avoids stale refs after modals)."""
+    invite_label = xpath_literal(invite_aria_label(name))
+    connect_label = xpath_literal(f"Connect with {name}")
     return find_element_any(driver, [
-        (By.XPATH, multi_tag_xpath(f"contains(@aria-label, 'Invite {name}')")),
-        (By.XPATH, multi_tag_xpath(f"contains(@aria-label, 'Connect with {name}')")),
+        (By.XPATH, multi_tag_xpath(f"@aria-label={invite_label}")),
+        (By.XPATH, multi_tag_xpath(f"@aria-label={connect_label}")),
     ], visible_only=True)
 
 
 def find_connect_in_more_menu(driver, name: str):
-    """Find Connect inside the open More dropdown — must match this person by name."""
+    """Find Connect inside the open More dropdown — exact match on this person's name."""
+    invite_label = xpath_literal(invite_aria_label(name))
     return find_element_any(driver, [
-        (By.XPATH, f"//div[@role='menu']//a[@role='menuitem'][.//*[contains(@aria-label, 'Invite {name}')]]"),
-        (By.XPATH, f"//ul[@role='menu']//a[@role='menuitem'][.//*[contains(@aria-label, 'Invite {name}')]]"),
-        (By.XPATH, f"//a[@role='menuitem'][.//div[contains(@aria-label, 'Invite {name}') and contains(@aria-label, 'to connect')]]"),
-        (By.XPATH, f"//div[@role='menu']//*[contains(@aria-label, 'Invite {name}') and contains(@aria-label, 'to connect')]"),
-        (By.XPATH, f"//a[contains(@href, 'custom-invite')][.//*[contains(@aria-label, 'Invite {name}')]]"),
+        (By.XPATH, f"//div[@role='menu']//a[@role='menuitem'][.//*[@aria-label={invite_label}]]"),
+        (By.XPATH, f"//ul[@role='menu']//a[@role='menuitem'][.//*[@aria-label={invite_label}]]"),
+        (By.XPATH, f"//a[@role='menuitem'][.//div[@aria-label={invite_label}]]"),
+        (By.XPATH, f"//div[@role='menu']//*[@aria-label={invite_label}]"),
+        (By.XPATH, f"//a[contains(@href, 'custom-invite')][.//*[@aria-label={invite_label}]]"),
     ], visible_only=True)
 
 
@@ -374,6 +595,10 @@ def connect_with_people(driver, search_url: str, custom_message: str,
     sent = 0
     sent_to: list[str] = []
     skipped: list[tuple[str, str]] = []
+    sent_log = SentLog()
+    log(f"Sent-log: {SENT_LOG_PATH}")
+    if sent_log.names or sent_log.profile_urls:
+        log(f"Loaded sent-log: {len(sent_log.names)} name(s), {len(sent_log.profile_urls)} profile URL(s).")
 
     for page in range(1, max_pages + 1):
         if sent >= max_connections:
@@ -399,8 +624,8 @@ def connect_with_people(driver, search_url: str, custom_message: str,
         driver.execute_script("window.scrollTo(0, 0);")
         time.sleep(0.5)
 
-        # --- Direct Connect names (re-find element fresh before each click) ---
-        connect_names = collect_connect_names(driver)
+        # --- Direct Connect entries (re-find element fresh before each click) ---
+        connect_entries = collect_connect_entries(driver)
 
         # --- Profile route entries: Follow + Message buttons ---
         # Collect name + profile URL upfront to avoid stale element refs after navigation.
@@ -414,6 +639,8 @@ def connect_with_people(driver, search_url: str, custom_message: str,
             try:
                 label = fb.get_dom_attribute("aria-label") or ""
                 name = label[len("Follow "):].strip()
+                if not is_valid_name(name):
+                    continue
                 href = collect_profile_url(fb)
                 if href:
                     profile_route_entries.append((name, href))
@@ -431,6 +658,8 @@ def connect_with_people(driver, search_url: str, custom_message: str,
             try:
                 label = mb.get_dom_attribute("aria-label") or ""
                 name = label[len("Send a message to "):].strip()
+                if not is_valid_name(name):
+                    continue
                 href = collect_profile_url(mb)
                 if href:
                     profile_route_entries.append((name, href))
@@ -441,11 +670,11 @@ def connect_with_people(driver, search_url: str, custom_message: str,
                 vlog(f"Error collecting Message entry: {exc}")
 
         vlog(
-            f"Found {len(connect_names)} Connect name(s) and "
+            f"Found {len(connect_entries)} Connect entry(ies) and "
             f"{len(profile_route_entries)} profile-route entry(ies) on page {page}."
         )
 
-        if not connect_names and not profile_route_entries:
+        if not connect_entries and not profile_route_entries:
             log(f"No actionable buttons found on page {page}. Reached end of results or hit a rate limit.")
             if VERBOSE:
                 all_els = driver.find_elements(
@@ -457,11 +686,18 @@ def connect_with_people(driver, search_url: str, custom_message: str,
             break
 
         # --- Process direct Connect by name (re-find element each time) ---
-        for name in connect_names:
+        for name, profile_url in connect_entries:
             if sent >= max_connections:
                 break
+            if sent_log.already_sent(name, profile_url):
+                reason = "Already sent in a previous run (sent-log)"
+                log(f"  SKIP {name}: {reason}")
+                skipped.append((name, reason))
+                continue
             try:
-                success, reason = connect_with_single_person(driver, name, custom_message)
+                success, reason = connect_with_single_person(
+                    driver, name, custom_message, profile_url=profile_url
+                )
             except Exception as exc:
                 reason = str(exc)
                 log(f"  SKIP {name}: {reason}")
@@ -469,6 +705,7 @@ def connect_with_people(driver, search_url: str, custom_message: str,
             if success:
                 sent += 1
                 sent_to.append(name)
+                sent_log.record(name, profile_url)
                 log(f"Progress: {sent}/{max_connections} connection requests sent.")
             elif reason:
                 skipped.append((name, reason))
@@ -478,6 +715,11 @@ def connect_with_people(driver, search_url: str, custom_message: str,
         for name, profile_url in profile_route_entries:
             if sent >= max_connections:
                 break
+            if sent_log.already_sent(name, profile_url):
+                reason = "Already sent in a previous run (sent-log)"
+                log(f"  SKIP {name}: {reason}")
+                skipped.append((name, reason))
+                continue
             try:
                 success, reason = connect_via_profile(driver, name, profile_url, custom_message, paginated_url)
             except Exception as exc:
@@ -487,6 +729,7 @@ def connect_with_people(driver, search_url: str, custom_message: str,
             if success:
                 sent += 1
                 sent_to.append(name)
+                sent_log.record(name, profile_url)
                 log(f"Progress: {sent}/{max_connections} connection requests sent.")
             elif reason:
                 skipped.append((name, reason))
@@ -502,8 +745,28 @@ def connect_with_people(driver, search_url: str, custom_message: str,
             log(f"  - {name}: {reason}")
 
 
-def handle_add_note_and_send(driver, first_name: str, custom_message: str) -> tuple[bool, str | None]:
+def handle_add_note_and_send(driver, full_name: str, custom_message: str) -> tuple[bool, str | None]:
     """Handle the 'Add a note' modal. LinkedIn renders it inside #interop-outlet shadow DOM."""
+    if not is_valid_name(full_name):
+        reason = "Invalid or unknown recipient name"
+        log(f"  SKIP {full_name or '(empty)'}: {reason}")
+        ensure_modal_closed(driver)
+        return False, reason
+
+    name_for_message = greeting_name(full_name)
+    vlog(f"Greeting name for message: {name_for_message!r} (from {full_name!r})")
+
+    if not wait_for_invite_modal(driver):
+        reason = "Invite modal did not appear"
+        log(f"  SKIP {full_name}: {reason}")
+        ensure_modal_closed(driver)
+        return False, reason
+
+    verified, verify_reason = verify_modal_recipient(driver, full_name, connect_button_verified=True)
+    if not verified:
+        log(f"  SKIP {full_name}: {verify_reason}")
+        ensure_modal_closed(driver)
+        return False, verify_reason
 
     add_note_btn = wait_for_shadow_dom(driver, "[aria-label*='Add a note']")
     if add_note_btn is None:
@@ -517,7 +780,7 @@ def handle_add_note_and_send(driver, first_name: str, custom_message: str) -> tu
 
     if add_note_btn is None:
         reason = "Add a note modal did not appear"
-        log(f"  SKIP {first_name}: {reason}")
+        log(f"  SKIP {full_name}: {reason}")
         if VERBOSE:
             all_btns = driver.find_elements(
                 By.XPATH, "//*[@aria-label and (self::button or self::div)]"
@@ -532,13 +795,18 @@ def handle_add_note_and_send(driver, first_name: str, custom_message: str) -> tu
     vlog("Clicked 'Add a note'.")
     time.sleep(CLICK_SETTLE_SECS)
 
-    success, reason = enter_custom_message(driver, first_name, custom_message)
+    success, reason = enter_custom_message(driver, full_name, name_for_message, custom_message)
     return success, reason
 
 
-def connect_with_single_person(driver, name: str, custom_message: str) -> tuple[bool, str | None]:
+def connect_with_single_person(driver, name: str, custom_message: str,
+                               profile_url: str | None = None) -> tuple[bool, str | None]:
     """Process a direct Connect/Invite element on the search results page."""
-    first_name = name.split()[0] if name and name != "Unknown" else name
+    if not is_valid_name(name):
+        reason = "Invalid or unknown recipient name"
+        log(f"  SKIP {name or '(empty)'}: {reason}")
+        return False, reason
+
     log(f"Sending connection request to {name}...")
 
     ensure_modal_closed(driver)
@@ -549,20 +817,26 @@ def connect_with_single_person(driver, name: str, custom_message: str) -> tuple[
         log(f"  SKIP {name}: {reason}")
         return False, reason
 
+    if profile_url is None:
+        profile_url = collect_profile_url(element)
+
     driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
     time.sleep(CLICK_SETTLE_SECS)
     js_click(driver, element)
     vlog("Clicked connect element.")
     time.sleep(CLICK_SETTLE_SECS)
-    wait_for_element(driver, By.CSS_SELECTOR, "#interop-outlet", timeout=ELEMENT_TIMEOUT)
 
-    return handle_add_note_and_send(driver, first_name, custom_message)
+    return handle_add_note_and_send(driver, name, custom_message)
 
 
 def connect_via_profile(driver, name: str, profile_url: str,
                         custom_message: str, return_url: str) -> tuple[bool, str | None]:
     """Handle Follow/Message-only cards: navigate to profile, open More (···), click Connect."""
-    first_name = name.split()[0] if name and name != "Unknown" else name
+    if not is_valid_name(name):
+        reason = "Invalid or unknown recipient name"
+        log(f"  SKIP {name or '(empty)'}: {reason}")
+        return False, reason
+
     log(f"Profile route for {name}...")
 
     vlog(f"Navigating to profile: {profile_url}")
@@ -609,23 +883,26 @@ def connect_via_profile(driver, name: str, profile_url: str,
     vlog("Clicked 'Connect' from More menu.")
     time.sleep(CLICK_SETTLE_SECS)
 
-    # Connect may open shadow modal OR navigate to custom-invite page
-    wait_for_element(driver, By.CSS_SELECTOR, "#interop-outlet", timeout=ELEMENT_TIMEOUT)
     if "custom-invite" in driver.current_url or "preload" in driver.current_url:
         vlog(f"Navigated to custom-invite page: {driver.current_url}")
         wait_for_page(driver)
 
-    success, reason = handle_add_note_and_send(driver, first_name, custom_message)
+    success, reason = handle_add_note_and_send(driver, name, custom_message)
 
     driver.get(return_url)
     wait_for_page(driver)
     return success, reason
 
 
-def enter_custom_message(driver, first_name: str, message_template: str) -> tuple[bool, str | None]:
-    name = first_name
+def enter_custom_message(driver, full_name: str, name_for_message: str,
+                         message_template: str) -> tuple[bool, str | None]:
+    if not is_valid_name(full_name):
+        reason = "Invalid or unknown recipient name"
+        log(f"  SKIP {full_name or '(empty)'}: {reason}")
+        return False, reason
+
     try:
-        message = message_template.format(name=first_name)
+        message = message_template.format(name=name_for_message)
         vlog(f"Message to send: {message!r}")
 
         textarea = wait_for_shadow_dom(driver, "textarea#custom-message")
@@ -638,7 +915,7 @@ def enter_custom_message(driver, first_name: str, message_template: str) -> tupl
             ])
         if textarea is None:
             reason = "Could not find message textarea"
-            log(f"  SKIP {first_name}: {reason}")
+            log(f"  SKIP {full_name}: {reason}")
             return False, reason
 
         driver.execute_script("""
@@ -658,11 +935,11 @@ def enter_custom_message(driver, first_name: str, message_template: str) -> tupl
             ])
         if send_btn is None:
             reason = "Could not find Send button"
-            log(f"  SKIP {first_name}: {reason}")
+            log(f"  SKIP {full_name}: {reason}")
             return False, reason
 
         js_click(driver, send_btn)
-        log(f"  Invitation sent to {first_name}.")
+        log(f"  Invitation sent to {full_name}.")
 
         try:
             WebDriverWait(driver, ELEMENT_TIMEOUT).until(
@@ -677,7 +954,7 @@ def enter_custom_message(driver, first_name: str, message_template: str) -> tupl
 
     except Exception as exc:
         reason = str(exc)
-        log(f"  ERROR while sending message to {name}: {reason}")
+        log(f"  ERROR while sending message to {full_name}: {reason}")
         return False, reason
 
 
