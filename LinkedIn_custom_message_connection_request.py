@@ -1,143 +1,611 @@
-
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
+import argparse
+import datetime
+import os
+import sys
 import time
 
-# Replace these with your LinkedIn credentials
-linkedin_username = 'shashwat1999@gmail.com'
-linkedin_password = ''
-linkedin_login_url = 'https://www.linkedin.com/login'
-# Copy paste the browser url when on the LinkedIn search page after clicking on the People tab and selecting all the filters you want
-linkedin_peoples_search_page_url = 'https://www.linkedin.com/search/results/people/?currentCompany=%5B%221382%22%5D&keywords=senior%20engineer&origin=FACETED_SEARCH&searchId=98f22d04-e3c4-437f-bdff-f4765c5a03db&sid=m1j'
-SLEEP_COUNT_IN_SECS = 5
-# May be asked to solve Captcha after repeated use
-SLEEP_COUNT_IN_SECS_LOGIN_PAGE = 15
-CUSTOM_MESSAGE_TO_BE_SENT_IN_THE_CONNECTION_INVITE = "\n\nI'm Shashwat, a software engineer at Qualcomm specializing in automation, AWS migration, and backend development. Looking forward to connect!\n\nRegards,\nShashwat"
-# Maximum connection requests to try to send in one session
-MAX_CONNECTION_SENT_COUNT = 10
-# Maxiumum search pages to iterate through
-MAX_PAGES_COUNT = 10
+from dotenv import load_dotenv
+from selenium import webdriver
+from selenium.common.exceptions import InvalidSessionIdException, WebDriverException
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
-# Function to log into LinkedIn
-def linkedin_login(username, password):
-    print("Attempting to log into LinkedIn...")
-    driver.get(linkedin_login_url)
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+load_dotenv()
+
+LINKEDIN_LOGIN_URL = "https://www.linkedin.com/login"
+SLEEP_SECS = 3
+LOGIN_SLEEP_SECS = 15
+MAX_CONNECTIONS = 10
+MAX_PAGES = 10
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+VERBOSE = False
+LOG_FILE = None  # opened in main() via setup_log_file()
+
+
+def log(msg: str) -> None:
+    print(msg)
+    if LOG_FILE:
+        LOG_FILE.write(msg + "\n")
+        LOG_FILE.flush()
+
+
+def vlog(msg: str) -> None:
+    """Always written to the log file; printed to console only in --verbose mode."""
+    if LOG_FILE:
+        LOG_FILE.write(f"  [verbose] {msg}\n")
+        LOG_FILE.flush()
+    if VERBOSE:
+        print(f"  [verbose] {msg}")
+
+
+def setup_log_file() -> None:
+    global LOG_FILE
+    os.makedirs("logs", exist_ok=True)
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    path = os.path.join("logs", f"run_{timestamp}.log")
+    LOG_FILE = open(path, "w", encoding="utf-8")
+    log(f"Log file: {path}")
+
+
+# ---------------------------------------------------------------------------
+# Browser / WebDriver helpers
+# ---------------------------------------------------------------------------
+
+def build_driver() -> webdriver.Chrome:
+    options = webdriver.ChromeOptions()
+    if not VERBOSE:
+        options.add_experimental_option("excludeSwitches", ["enable-logging"])
+    log("Launching Chrome...")
+    driver = webdriver.Chrome(options=options)
+    driver.implicitly_wait(5)
+    return driver
+
+
+def multi_tag_xpath(aria_condition: str) -> str:
+    """Build an XPath matching button/div/a elements with the given aria-label condition.
+    LinkedIn renders interactive elements as any of these tags depending on the UI version."""
+    return f"//*[(self::button or self::div or self::a) and ({aria_condition})]"
+
+
+def find_in_shadow_dom(driver, css_selector: str):
+    """Query LinkedIn's interop shadow DOM (#interop-outlet) used for modal dialogs."""
+    try:
+        host = driver.find_element(By.CSS_SELECTOR, "#interop-outlet")
+        el = driver.execute_script("""
+            const root = arguments[0].shadowRoot;
+            return root ? root.querySelector(arguments[1]) : null;
+        """, host, css_selector)
+        if el:
+            vlog(f"Found element in shadow DOM: {css_selector!r}")
+        return el
+    except Exception as exc:
+        vlog(f"Shadow DOM query failed for {css_selector!r}: {exc}")
+        return None
+
+
+def find_element_any(driver_or_el, selectors, visible_only=False):
+    """Try multiple (By, value) pairs and return the first match, or None."""
+    for by, value in selectors:
+        try:
+            elements = driver_or_el.find_elements(by, value)
+            for el in elements:
+                if visible_only and not el.is_displayed():
+                    vlog(f"Skipping hidden element: {by}={value!r}")
+                    continue
+                vlog(f"Matched selector: {by}={value!r}")
+                return el
+            vlog(f"No match for selector: {by}={value!r}")
+        except Exception as exc:
+            vlog(f"Error with selector: {by}={value!r} — {exc}")
+    return None
+
+
+def js_click(driver, el) -> None:
+    """JS click — works on any element type (div, a, button) and bypasses overlays."""
+    driver.execute_script("arguments[0].click();", el)
+
+
+def collect_profile_url(element) -> str | None:
+    """Find the /in/ profile link from the card containing the given element."""
+    for ancestor_xpath in [
+        "./ancestor::li//a[contains(@href, '/in/')]",
+        "./ancestor::div[.//a[contains(@href, '/in/')]][1]//a[contains(@href, '/in/')]",
+        "./preceding::a[contains(@href, '/in/')][1]",
+        "./following::a[contains(@href, '/in/')][1]",
+    ]:
+        try:
+            link_el = element.find_element(By.XPATH, ancestor_xpath)
+            href = link_el.get_dom_attribute("href")
+            if href and "/in/" in href:
+                vlog(f"Found profile link via: {ancestor_xpath}")
+                return href
+        except Exception:
+            continue
+    return None
+
+
+# ---------------------------------------------------------------------------
+# LinkedIn actions
+# ---------------------------------------------------------------------------
+
+def linkedin_login(driver, username: str, password: str) -> bool:
+    log("Navigating to LinkedIn login page...")
+    driver.get(LINKEDIN_LOGIN_URL)
+    vlog(f"Current URL: {driver.current_url}")
 
     try:
-        username_input = driver.find_element(By.ID, 'username')
-        username_input.send_keys(username)
-        password_input = driver.find_element(By.ID, 'password')
-        password_input.send_keys(password)
-        password_input.send_keys(Keys.RETURN)
-        time.sleep(SLEEP_COUNT_IN_SECS_LOGIN_PAGE) # Solve Captcha if prompted. Will be asked only once.
-
-        # Check if login is successful
-        if "feed" in driver.current_url:
-            print("Login successful!")
-        else:
-            print("Login failed. Please check credentials or CAPTCHA.")
-            driver.quit()
+        # visible_only=True skips hidden passkey/Apple sign-in inputs
+        username_input = find_element_any(driver, [
+            (By.ID, "username"),
+            (By.NAME, "session_key"),
+            (By.XPATH, "//input[@type='email']"),
+            (By.XPATH, "//input[contains(@placeholder, 'Email') or contains(@placeholder, 'email') or contains(@placeholder, 'phone')]"),
+            (By.XPATH, "//input[@autocomplete='username']"),
+        ], visible_only=True)
+        if username_input is None:
+            log("ERROR: Could not find a visible username/email field.")
+            vlog(f"Page source snippet: {driver.page_source[:2000]}")
             return False
-    except Exception as e:
-        print(f"Error during login: {e}")
-        driver.quit()
-        return False
-    return True
+        username_input.click()
+        username_input.send_keys(username)
+        vlog("Username entered.")
 
-# Function to clean the LinkedIn search page URL
-def parse_linkedin_peoples_search_page_url(url):
-    print("Parsing the LinkedIn search page URL...")
-    if '&page=' in url:
-        url = url.split('&page=')[0]
-    print(f"Cleaned URL: {url}")
+        password_input = find_element_any(driver, [
+            (By.ID, "password"),
+            (By.NAME, "session_password"),
+            (By.XPATH, "//input[@type='password']"),
+        ], visible_only=True)
+        if password_input is None:
+            log("ERROR: Could not find password field.")
+            return False
+        password_input.send_keys(password)
+        vlog("Password entered.")
+
+        password_input.send_keys(Keys.RETURN)
+        log(f"Credentials submitted. Waiting {LOGIN_SLEEP_SECS}s for page to load...")
+        time.sleep(LOGIN_SLEEP_SECS)
+        vlog(f"Post-login URL: {driver.current_url}")
+
+        if "checkpoint" in driver.current_url or "challenge" in driver.current_url:
+            log("")
+            log(">>> LinkedIn is showing a security verification challenge.")
+            log(">>> Please complete it in the browser window (email code, phone, etc.).")
+            log(">>> Waiting up to 90 seconds for you to finish...")
+            log("")
+            for i in range(18):
+                time.sleep(5)
+                current = driver.current_url
+                vlog(f"  [{(i+1)*5}s] URL: {current}")
+                if "feed" in current:
+                    break
+                if "checkpoint" not in current and "challenge" not in current and "login" not in current:
+                    break
+
+        if "feed" in driver.current_url:
+            log("Login successful.")
+            return True
+        elif "checkpoint" in driver.current_url or "challenge" in driver.current_url:
+            log("ERROR: Security checkpoint not completed in time. Please re-run and solve it faster.")
+            return False
+        elif "login" in driver.current_url:
+            log("ERROR: Still on login page — credentials may be wrong.")
+            return False
+        else:
+            log(f"Login appears successful (URL: {driver.current_url}).")
+            return True
+    except Exception as exc:
+        log(f"ERROR during login: {exc}")
+        return False
+
+
+def strip_page_param(url: str) -> str:
+    if "&page=" in url:
+        url = url.split("&page=")[0]
+    vlog(f"Cleaned search URL: {url}")
     return url
 
-# Function to connect with people
-def connect_with_people(search_url, max_connection_sent_count=MAX_CONNECTION_SENT_COUNT, max_pages=MAX_PAGES_COUNT, stop_message="No results found"):
 
-    page = 1
-    connection_sent_count = 0
-    while page <= max_pages and connection_sent_count < max_connection_sent_count:
-        # Append the current page number to the URL
+def connect_with_people(driver, search_url: str, custom_message: str,
+                        max_connections: int = MAX_CONNECTIONS,
+                        max_pages: int = MAX_PAGES) -> None:
+    search_url = strip_page_param(search_url)
+    sent = 0
+    sent_to: list[str] = []
+
+    for page in range(1, max_pages + 1):
+        if sent >= max_connections:
+            log(f"Reached max connection limit ({max_connections}). Stopping.")
+            break
+
         paginated_url = f"{search_url}&page={page}"
-        print(f"Processing page {page}: {paginated_url}")
-        
-        # Open the LinkedIn People Search page URL
-        driver.get(paginated_url)
-        time.sleep(SLEEP_COUNT_IN_SECS)  # Wait for the page to load
-
-        # This logic is not working right now. Will debug and fix this later
-        # # Check for the stop message indicating the end of results
-        # try:
-        #     # Locate the element with the message (you can modify the XPath to match the actual message element)
-        #     stop_element = driver.find_element(By.XPATH, f"//h2[contains(text(), '{stop_message}')]")
-        #     print("Stop message found, exiting...")
-        #     break  # Exit the loop if the stop message is found
-        # except:
-        #     print(f"No stop message on page {page}, continuing...")
-
+        log(f"\n--- Page {page} ---")
+        log(f"Opening: {paginated_url}")
         try:
-            # Get all connection buttons
-            connect_buttons = driver.find_elements(By.XPATH, "//button[contains(@aria-label, 'Invite')]")
-            for button in connect_buttons:
-                if connection_sent_count >= max_connection_sent_count:
-                    break
-                connect_with_single_person(button)
-                connection_sent_count += 1
-            print("Finished sending connection requests on the current page.")
-        except Exception as e:
-            print(f"Error during connecting with people: {e}")
+            driver.get(paginated_url)
+        except (InvalidSessionIdException, WebDriverException) as exc:
+            log(f"Browser session lost — stopping early. ({exc.__class__.__name__})")
+            break
+        time.sleep(SLEEP_SECS)
+        vlog(f"Page title: {driver.title}")
 
-        
-        # Move to the next page
-        page += 1
+        # Scroll to trigger lazy-loading of result cards
+        vlog("Scrolling to load all results...")
+        for _ in range(5):
+            driver.execute_script("window.scrollBy(0, 600);")
+            time.sleep(0.8)
+        driver.execute_script("window.scrollTo(0, 0);")
+        time.sleep(1)
 
-# Function to connect with a single person
-def connect_with_single_person(button):
+        # --- Direct Connect/Invite elements (button or div) ---
+        connect_elements = driver.find_elements(
+            By.XPATH,
+            multi_tag_xpath(
+                "(contains(@aria-label, 'Invite') or contains(@aria-label, 'Connect')) and "
+                "not(contains(@aria-label, 'Unfollow')) and "
+                "not(contains(@aria-label, 'Following'))"
+            )
+        )
+
+        # --- Profile route entries: Follow + Message buttons ---
+        # Collect name + profile URL upfront to avoid stale element refs after navigation.
+        profile_route_entries: list[tuple[str, str]] = []
+
+        # Follow: <button/div aria-label="Follow {name}">
+        for fb in driver.find_elements(
+            By.XPATH,
+            "//*[starts-with(@aria-label, 'Follow ') and (self::button or self::div)]"
+        ):
+            try:
+                label = fb.get_dom_attribute("aria-label") or ""
+                name = label[len("Follow "):].strip()
+                href = collect_profile_url(fb)
+                if href:
+                    profile_route_entries.append((name, href))
+                    vlog(f"Queued Follow profile: {name} -> {href}")
+                else:
+                    vlog(f"Could not find profile URL for Follow button: {name}")
+            except Exception as exc:
+                vlog(f"Error collecting Follow entry: {exc}")
+
+        # Message: <a aria-label="Send a message to {name}">
+        for mb in driver.find_elements(
+            By.XPATH,
+            "//a[starts-with(@aria-label, 'Send a message to ')]"
+        ):
+            try:
+                label = mb.get_dom_attribute("aria-label") or ""
+                name = label[len("Send a message to "):].strip()
+                href = collect_profile_url(mb)
+                if href:
+                    profile_route_entries.append((name, href))
+                    vlog(f"Queued Message profile: {name} -> {href}")
+                else:
+                    vlog(f"Could not find profile URL for Message button: {name}")
+            except Exception as exc:
+                vlog(f"Error collecting Message entry: {exc}")
+
+        vlog(
+            f"Found {len(connect_elements)} Connect element(s) and "
+            f"{len(profile_route_entries)} profile-route entry(ies) on page {page}."
+        )
+
+        if not connect_elements and not profile_route_entries:
+            log(f"No actionable buttons found on page {page}. Reached end of results or hit a rate limit.")
+            if VERBOSE:
+                all_els = driver.find_elements(
+                    By.XPATH, "//*[@aria-label and (self::button or self::div or self::a)]"
+                )
+                log(f"  [verbose] All interactive elements with aria-label ({len(all_els)} total):")
+                for el in all_els[:40]:
+                    log(f"    <{el.tag_name}> aria-label={el.get_dom_attribute('aria-label')!r}")
+            break
+
+        # --- Process direct Connect elements ---
+        for element in connect_elements:
+            if sent >= max_connections:
+                break
+            name = "Unknown"
+            try:
+                aria_label = element.get_dom_attribute("aria-label") or ""
+                if "Invite" in aria_label and "to connect" in aria_label:
+                    name = aria_label[aria_label.index("Invite") + len("Invite"):
+                                      aria_label.index("to connect")].strip()
+                elif "Connect with" in aria_label:
+                    name = aria_label[aria_label.index("Connect with") + len("Connect with"):].strip()
+                success = connect_with_single_person(driver, element, name, custom_message)
+            except Exception as exc:
+                log(f"  SKIP {name}: {exc}")
+                success = False
+            if success:
+                sent += 1
+                sent_to.append(name)
+                log(f"Progress: {sent}/{max_connections} connection requests sent.")
+
+        # --- Process Follow/Message profiles via More menu ---
+        for name, profile_url in profile_route_entries:
+            if sent >= max_connections:
+                break
+            try:
+                success = connect_via_profile(driver, name, profile_url, custom_message, paginated_url)
+            except Exception as exc:
+                log(f"  SKIP {name}: {exc}")
+                success = False
+            if success:
+                sent += 1
+                sent_to.append(name)
+                log(f"Progress: {sent}/{max_connections} connection requests sent.")
+
+    log(f"\nDone. Sent {sent}/{max_connections} connection requests.")
+    if sent_to:
+        log("Successfully connected with:")
+        for name in sent_to:
+            log(f"  - {name}")
+
+
+def handle_add_note_and_send(driver, first_name: str, custom_message: str) -> bool:
+    """Handle the 'Add a note' modal. LinkedIn renders it inside #interop-outlet shadow DOM."""
+    time.sleep(1)
+
+    add_note_btn = find_element_any(driver, [
+        (By.XPATH, multi_tag_xpath("contains(@aria-label, 'Add a note')")),
+        (By.XPATH, multi_tag_xpath("contains(@aria-label, 'Include a note')")),
+        (By.XPATH, "//span[contains(text(), 'Add a note')]/ancestor::*[self::button or self::div]"),
+        (By.XPATH, "//span[contains(text(), 'note')]/ancestor::*[self::button or self::div]"),
+    ])
+    if add_note_btn is None:
+        add_note_btn = (
+            find_in_shadow_dom(driver, "[aria-label*='Add a note']") or
+            find_in_shadow_dom(driver, "[aria-label*='Include a note']") or
+            find_in_shadow_dom(driver, "button[aria-label*='note']")
+        )
+
+    if add_note_btn is None:
+        log(f"  WARNING: 'Add a note' button not found for {first_name}. Skipping to avoid blank note.")
+        if VERBOSE:
+            all_btns = driver.find_elements(
+                By.XPATH, "//*[@aria-label and (self::button or self::div)]"
+            )
+            log(f"  [verbose] Interactive elements on page ({len(all_btns)} total):")
+            for b in all_btns[:20]:
+                log(f"    <{b.tag_name}> {b.get_dom_attribute('aria-label')!r}")
+        dismiss = (
+            find_element_any(driver, [
+                (By.XPATH, multi_tag_xpath("contains(@aria-label, 'Dismiss')")),
+                (By.XPATH, multi_tag_xpath("contains(@aria-label, 'Cancel')")),
+                (By.XPATH, multi_tag_xpath("contains(@aria-label, 'Close')")),
+            ]) or
+            find_in_shadow_dom(driver, "[aria-label*='Dismiss']") or
+            find_in_shadow_dom(driver, "[aria-label*='Cancel']")
+        )
+        if dismiss:
+            try:
+                js_click(driver, dismiss)
+                vlog("Dismissed modal.")
+            except Exception:
+                pass
+        return False
+
+    js_click(driver, add_note_btn)
+    vlog("Clicked 'Add a note'.")
+    time.sleep(SLEEP_SECS)
+
+    return enter_custom_message(driver, first_name, custom_message)
+
+
+def connect_with_single_person(driver, element, name: str, custom_message: str) -> bool:
+    """Process a direct Connect/Invite element on the search results page."""
+    first_name = name.split()[0] if name and name != "Unknown" else name
+    log(f"Sending connection request to {name}...")
+
+    js_click(driver, element)
+    vlog("Clicked connect element.")
+    time.sleep(SLEEP_SECS)
+
+    return handle_add_note_and_send(driver, first_name, custom_message)
+
+
+def connect_via_profile(driver, name: str, profile_url: str,
+                        custom_message: str, return_url: str) -> bool:
+    """Handle Follow/Message-only cards: navigate to profile, open More (···), click Connect."""
+    first_name = name.split()[0] if name and name != "Unknown" else name
+    log(f"Profile route for {name}...")
+
+    vlog(f"Navigating to profile: {profile_url}")
+    driver.get(profile_url)
+    time.sleep(SLEEP_SECS)
+
+    more_btn = find_element_any(driver, [
+        (By.XPATH, "//*[@aria-label='More' and (self::button or self::div)]"),
+        (By.XPATH, "//*[contains(@aria-label, 'More actions') and (self::button or self::div)]"),
+    ], visible_only=True)
+    if more_btn is None:
+        log(f"  SKIP {name}: 'More' button not found on profile page.")
+        driver.get(return_url)
+        time.sleep(SLEEP_SECS)
+        return False
+
+    js_click(driver, more_btn)
+    vlog("Clicked 'More' button.")
+    time.sleep(1.5)
+
+    connect_option = find_element_any(driver, [
+        (By.XPATH, "//*[contains(@aria-label, 'Invite') and contains(@aria-label, 'to connect')]"),
+        (By.XPATH, "//span[text()='Connect']/ancestor::*[@aria-label]"),
+    ])
+    if connect_option is None:
+        log(f"  SKIP {name}: No 'Connect' option in More menu (connection may be restricted).")
+        driver.execute_script("document.body.click();")
+        time.sleep(0.5)
+        driver.get(return_url)
+        time.sleep(SLEEP_SECS)
+        return False
+
+    js_click(driver, connect_option)
+    vlog("Clicked 'Connect' from More menu.")
+    time.sleep(SLEEP_SECS)
+
+    result = handle_add_note_and_send(driver, first_name, custom_message)
+
+    driver.get(return_url)
+    time.sleep(SLEEP_SECS)
+    return result
+
+
+def enter_custom_message(driver, first_name: str, message_template: str) -> bool:
+    name = first_name
     try:
-        button_aria_label = button.get_attribute('aria-label')
-        name = button_aria_label[button_aria_label.index("Invite") + len("Invite"):button_aria_label.index("to connect")].strip()
-        print(f"Sending connection request to {name}...")
-        
-        button.click()
-        time.sleep(SLEEP_COUNT_IN_SECS)
+        message = message_template.format(name=first_name)
+        vlog(f"Message to send: {message!r}")
 
-        # Click on "Add a note"
-        add_a_note_button = driver.find_element(By.XPATH, "//button[contains(@aria-label, 'Add a note')]")
-        add_a_note_button.click()
-        time.sleep(SLEEP_COUNT_IN_SECS)
-        
-        enter_custom_message(name)
+        textarea = find_element_any(driver, [
+            (By.ID, "custom-message"),
+            (By.XPATH, "//textarea[contains(@name, 'message')]"),
+            (By.XPATH, "//textarea[contains(@id, 'message')]"),
+            (By.XPATH, "//textarea"),
+        ])
+        if textarea is None:
+            textarea = (
+                find_in_shadow_dom(driver, "textarea#custom-message") or
+                find_in_shadow_dom(driver, "textarea[name*='message']") or
+                find_in_shadow_dom(driver, "textarea")
+            )
+        if textarea is None:
+            log(f"  ERROR: Could not find message textarea for {first_name}.")
+            return False
 
-    except Exception as e:
-        print(f"Error occurred while connecting with {name}: {e}")
+        # Clear and type — dispatch input event for React/Vue to register the change
+        driver.execute_script("""
+            arguments[0].value = '';
+            arguments[0].dispatchEvent(new Event('input', {bubbles: true}));
+        """, textarea)
+        textarea.send_keys(message)
+        vlog("Message typed into textarea.")
+        time.sleep(SLEEP_SECS)
 
-# Function to enter a custom message in the textarea
-def enter_custom_message(name):
+        send_btn = find_element_any(driver, [
+            (By.XPATH, multi_tag_xpath("contains(@aria-label, 'Send invitation')")),
+            (By.XPATH, multi_tag_xpath("contains(@aria-label, 'Send now')")),
+            (By.XPATH, "//span[contains(text(), 'Send')]/ancestor::*[self::button or self::div]"),
+        ])
+        if send_btn is None:
+            send_btn = (
+                find_in_shadow_dom(driver, "[aria-label*='Send invitation']") or
+                find_in_shadow_dom(driver, "[aria-label*='Send now']") or
+                find_in_shadow_dom(driver, "[aria-label*='Send']")
+            )
+        if send_btn is None:
+            log(f"  ERROR: Could not find 'Send' button for {first_name}.")
+            return False
+
+        js_click(driver, send_btn)
+        log(f"  Invitation sent to {first_name}.")
+        time.sleep(SLEEP_SECS)
+        return True
+
+    except Exception as exc:
+        log(f"  ERROR while sending message to {name}: {exc}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Send personalised LinkedIn connection requests automatically."
+    )
+    parser.add_argument(
+        "--search-url",
+        help=(
+            "LinkedIn People search URL (overrides LINKEDIN_SEARCH_URL in .env). "
+            "Go to LinkedIn > Search > People, apply your filters, then copy the URL."
+        ),
+    )
+    parser.add_argument(
+        "--max-connections",
+        type=int,
+        default=MAX_CONNECTIONS,
+        help=f"Max connection requests to send per run (default: {MAX_CONNECTIONS}).",
+    )
+    parser.add_argument(
+        "--max-pages",
+        type=int,
+        default=MAX_PAGES,
+        help=f"Max search result pages to iterate through (default: {MAX_PAGES}).",
+    )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Enable verbose/debug logging to console (always written to log file).",
+    )
+    return parser.parse_args()
+
+
+def main():
+    global VERBOSE
+    args = parse_args()
+    VERBOSE = args.verbose
+
+    setup_log_file()
+
+    if VERBOSE:
+        log("Verbose mode enabled.")
+
+    username = os.getenv("LINKEDIN_USERNAME", "")
+    password = os.getenv("LINKEDIN_PASSWORD", "")
+    search_url = args.search_url or os.getenv("LINKEDIN_SEARCH_URL", "")
+    custom_message = os.getenv("CUSTOM_MESSAGE", "Hi {name}, I'd love to connect!")
+
+    missing = []
+    if not username:
+        missing.append("LINKEDIN_USERNAME")
+    if not password:
+        missing.append("LINKEDIN_PASSWORD")
+    if not search_url:
+        missing.append("LINKEDIN_SEARCH_URL (or pass --search-url)")
+    if missing:
+        log(f"ERROR: Missing required config: {', '.join(missing)}")
+        log("Set these in your .env file or pass --search-url on the command line.")
+        sys.exit(1)
+
+    vlog(f"Username: {username}")
+    vlog(f"Search URL: {search_url}")
+    vlog(f"Message template: {custom_message!r}")
+    vlog(f"Max connections: {args.max_connections} | Max pages: {args.max_pages}")
+
+    driver = build_driver()
     try:
-        custom_message = f"Hi {name}, {CUSTOM_MESSAGE_TO_BE_SENT_IN_THE_CONNECTION_INVITE}"
-        textarea = driver.find_element(By.ID, 'custom-message')
-        textarea.clear()
-        textarea.send_keys(custom_message)
-        print(f"Custom message for {name} entered successfully.")
-        time.sleep(SLEEP_COUNT_IN_SECS)
+        if linkedin_login(driver, username, password):
+            connect_with_people(
+                driver,
+                search_url,
+                custom_message,
+                max_connections=args.max_connections,
+                max_pages=args.max_pages,
+            )
+    except (InvalidSessionIdException, WebDriverException) as exc:
+        log(f"\nBrowser session ended unexpectedly: {exc.__class__.__name__}")
+        log("The run has ended. Check the log file for what was completed.")
+    finally:
+        log("\nClosing browser...")
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        if LOG_FILE:
+            LOG_FILE.close()
 
-        send_invitation_button = driver.find_element(By.XPATH, "//button[contains(@aria-label, 'Send invitation')]")
-        send_invitation_button.click()
-        print(f"Invitation sent to {name}.")
-        time.sleep(SLEEP_COUNT_IN_SECS)
-        
-    except Exception as e:
-        print(f"Error while entering custom message for {name}: {e}")
 
-# Main logic
 if __name__ == "__main__":
-    driver = webdriver.Chrome()  # Initialize WebDriver
-
-    if linkedin_login(linkedin_username, linkedin_password):
-        linkedin_peoples_search_page_url = parse_linkedin_peoples_search_page_url(linkedin_peoples_search_page_url)
-        connect_with_people(linkedin_peoples_search_page_url)
-    
-    print("Closing browser...")
-    driver.quit()
+    main()

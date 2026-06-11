@@ -123,6 +123,9 @@ celerybeat.pid
 
 # Environments
 .env
+
+# Run logs
+logs/
 .venv
 env/
 venv/
