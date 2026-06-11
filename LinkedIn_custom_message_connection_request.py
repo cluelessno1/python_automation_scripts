@@ -903,6 +903,7 @@ def enter_custom_message(driver, full_name: str, name_for_message: str,
 
     try:
         message = message_template.format(name=name_for_message)
+        log(f"  Connection message: {message}")
         vlog(f"Message to send: {message!r}")
 
         textarea = wait_for_shadow_dom(driver, "textarea#custom-message")
